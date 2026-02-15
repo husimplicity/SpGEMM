@@ -49,6 +49,10 @@ def _extract_right_monomial_csr(other):
     n_rows, _ = other.shape
     if n_rows == 0:
         return None
+    # Necessary condition for row-monomial CSR: exactly one nonzero per row.
+    # This avoids scanning row_nnz on common random matrices.
+    if getattr(other, "nnz", None) != n_rows:
+        return None
 
     row_nnz = np.diff(other.indptr)
     if row_nnz.shape[0] != n_rows or not np.all(row_nnz == 1):
