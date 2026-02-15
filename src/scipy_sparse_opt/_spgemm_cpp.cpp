@@ -25,6 +25,12 @@ constexpr std::int64_t kUltraHashWorkThreshold = 65536;
 constexpr std::int64_t kHashVsDenseRatio = 8;
 // Thread count target derived from total symbolic work.
 constexpr std::int64_t kWorkPerThreadTarget = 300000;
+// For very small total_work, a one-phase single-thread kernel is cheaper than
+// symbolic+numeric two-phase scheduling.
+constexpr std::int64_t kTinyOnePhaseWorkThreshold = 220000;
+constexpr std::int64_t kTinyAvgRowWorkThreshold = 10;
+constexpr std::int64_t kTinyNoDedupRowWorkThreshold = 64;
+constexpr std::int64_t kTinyLinearRowWorkThreshold = 256;
 // Ultra-wide thread caps are split by total work to avoid over/under-subscription.
 constexpr std::int64_t kUltraWideHighWorkThreshold = 1000000000;
 constexpr int kUltraWideLowWorkThreadCap = 8;
@@ -278,6 +284,150 @@ static void numeric_fill_range(
 }
 
 template <typename IndexT>
+static py::tuple tiny_one_phase_spgemm(
+    const IndexT* a_indptr,
+    const IndexT* a_indices,
+    const double* a_data,
+    std::int64_t a_rows,
+    const std::int64_t* prefix_work,
+    const IndexT* b_indptr,
+    const IndexT* b_indices,
+    const double* b_data,
+    std::int64_t total_work) {
+    if constexpr (std::is_same_v<IndexT, std::int32_t>) {
+        if (total_work > static_cast<std::int64_t>(std::numeric_limits<std::int32_t>::max())) {
+            throw std::overflow_error("nnz exceeds int32 capacity in tiny i32 kernel");
+        }
+    }
+
+    py::array_t<IndexT> out_indptr(a_rows + 1);
+    auto* out_indptr_ptr = static_cast<IndexT*>(out_indptr.mutable_data());
+    out_indptr_ptr[0] = 0;
+
+    std::vector<IndexT> out_indices_vec;
+    std::vector<double> out_data_vec;
+    out_indices_vec.reserve(static_cast<std::size_t>(std::max<std::int64_t>(0, total_work)));
+    out_data_vec.reserve(static_cast<std::size_t>(std::max<std::int64_t>(0, total_work)));
+
+    std::vector<std::int64_t> hash_keys;
+    std::vector<double> hash_vals;
+    std::vector<std::int64_t> touched_slots;
+    touched_slots.reserve(128);
+    std::vector<IndexT> linear_cols;
+    std::vector<double> linear_vals;
+    linear_cols.reserve(64);
+    linear_vals.reserve(64);
+
+    for (std::int64_t i = 0; i < a_rows; ++i) {
+        const std::int64_t row_work = prefix_work[i + 1] - prefix_work[i];
+        const std::int64_t a_begin = static_cast<std::int64_t>(a_indptr[i]);
+        const std::int64_t a_end = static_cast<std::int64_t>(a_indptr[i + 1]);
+        if (row_work > 0) {
+            if (row_work <= kTinyNoDedupRowWorkThreshold) {
+                // Tiny fast path: emit row contributions directly.
+                // CSR allows duplicates; semantic equality is preserved.
+                for (std::int64_t ap = a_begin; ap < a_end; ++ap) {
+                    const std::int64_t k = static_cast<std::int64_t>(a_indices[ap]);
+                    const double a_val = a_data[ap];
+                    const std::int64_t b_begin = static_cast<std::int64_t>(b_indptr[k]);
+                    const std::int64_t b_end = static_cast<std::int64_t>(b_indptr[k + 1]);
+                    for (std::int64_t bp = b_begin; bp < b_end; ++bp) {
+                        out_indices_vec.push_back(static_cast<IndexT>(b_indices[bp]));
+                        out_data_vec.push_back(a_val * b_data[bp]);
+                    }
+                }
+            } else if (row_work <= kTinyLinearRowWorkThreshold) {
+                linear_cols.clear();
+                linear_vals.clear();
+                for (std::int64_t ap = a_begin; ap < a_end; ++ap) {
+                    const std::int64_t k = static_cast<std::int64_t>(a_indices[ap]);
+                    const double a_val = a_data[ap];
+                    const std::int64_t b_begin = static_cast<std::int64_t>(b_indptr[k]);
+                    const std::int64_t b_end = static_cast<std::int64_t>(b_indptr[k + 1]);
+                    for (std::int64_t bp = b_begin; bp < b_end; ++bp) {
+                        const IndexT j = static_cast<IndexT>(b_indices[bp]);
+                        const double prod = a_val * b_data[bp];
+                        bool found = false;
+                        for (std::size_t t = 0; t < linear_cols.size(); ++t) {
+                            if (linear_cols[t] == j) {
+                                linear_vals[t] += prod;
+                                found = true;
+                                break;
+                            }
+                        }
+                        if (!found) {
+                            linear_cols.push_back(j);
+                            linear_vals.push_back(prod);
+                        }
+                    }
+                }
+                out_indices_vec.insert(out_indices_vec.end(), linear_cols.begin(), linear_cols.end());
+                out_data_vec.insert(out_data_vec.end(), linear_vals.begin(), linear_vals.end());
+            } else {
+                std::int64_t table_size = 16;
+                while (table_size < row_work * 2) {
+                    table_size <<= 1;
+                }
+                if (static_cast<std::int64_t>(hash_keys.size()) < table_size) {
+                    hash_keys.assign(static_cast<std::size_t>(table_size), -1);
+                    hash_vals.assign(static_cast<std::size_t>(table_size), 0.0);
+                }
+                touched_slots.clear();
+                const std::uint64_t mask = static_cast<std::uint64_t>(table_size - 1);
+
+                for (std::int64_t ap = a_begin; ap < a_end; ++ap) {
+                    const std::int64_t k = static_cast<std::int64_t>(a_indices[ap]);
+                    const double a_val = a_data[ap];
+                    const std::int64_t b_begin = static_cast<std::int64_t>(b_indptr[k]);
+                    const std::int64_t b_end = static_cast<std::int64_t>(b_indptr[k + 1]);
+                    for (std::int64_t bp = b_begin; bp < b_end; ++bp) {
+                        const std::int64_t j = static_cast<std::int64_t>(b_indices[bp]);
+                        const double prod = a_val * b_data[bp];
+                        std::uint64_t slot = hash_col(j, mask);
+                        while (true) {
+                            const std::int64_t key = hash_keys[static_cast<std::size_t>(slot)];
+                            if (key == -1) {
+                                hash_keys[static_cast<std::size_t>(slot)] = j;
+                                hash_vals[static_cast<std::size_t>(slot)] = prod;
+                                touched_slots.push_back(static_cast<std::int64_t>(slot));
+                                break;
+                            }
+                            if (key == j) {
+                                hash_vals[static_cast<std::size_t>(slot)] += prod;
+                                break;
+                            }
+                            slot = (slot + 1) & mask;
+                        }
+                    }
+                }
+
+                for (const std::int64_t slot_i : touched_slots) {
+                    const std::size_t s = static_cast<std::size_t>(slot_i);
+                    out_indices_vec.push_back(static_cast<IndexT>(hash_keys[s]));
+                    out_data_vec.push_back(hash_vals[s]);
+                    hash_keys[s] = -1;
+                }
+            }
+        }
+
+        if constexpr (std::is_same_v<IndexT, std::int32_t>) {
+            if (out_indices_vec.size() > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
+                throw std::overflow_error("nnz exceeds int32 capacity in tiny i32 kernel");
+            }
+        }
+        out_indptr_ptr[i + 1] = static_cast<IndexT>(out_indices_vec.size());
+    }
+
+    py::array_t<IndexT> out_indices(out_indices_vec.size());
+    py::array_t<double> out_data(out_data_vec.size());
+    auto* out_indices_ptr = static_cast<IndexT*>(out_indices.mutable_data());
+    auto* out_data_ptr = static_cast<double*>(out_data.mutable_data());
+    std::copy(out_indices_vec.begin(), out_indices_vec.end(), out_indices_ptr);
+    std::copy(out_data_vec.begin(), out_data_vec.end(), out_data_ptr);
+    return py::make_tuple(out_indptr, out_indices, out_data);
+}
+
+template <typename IndexT>
 static py::tuple csr_spgemm_f64_impl(
     py::array_t<IndexT, py::array::c_style | py::array::forcecast> a_indptr_arr,
     py::array_t<IndexT, py::array::c_style | py::array::forcecast> a_indices_arr,
@@ -355,6 +505,22 @@ static py::tuple csr_spgemm_f64_impl(
             out_indptr_ptr[i] = 0;
         }
         return py::make_tuple(out_indptr, out_indices, out_data);
+    }
+
+    const bool use_tiny_one_phase =
+        total_work <= kTinyOnePhaseWorkThreshold &&
+        total_work <= (a_rows * kTinyAvgRowWorkThreshold);
+    if (use_tiny_one_phase) {
+        return tiny_one_phase_spgemm<IndexT>(
+            a_indptr,
+            a_indices,
+            a_data,
+            a_rows,
+            prefix_work.data(),
+            b_indptr,
+            b_indices,
+            b_data,
+            total_work);
     }
 
     const int thread_limit_by_work =
